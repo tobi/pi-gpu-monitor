@@ -1,0 +1,14 @@
+{
+  "name": "pi-gpu-monitor",
+  "version": "1.0.0",
+  "description": "Live GPU monitoring widget for pi — sparkline utilization and memory usage via nvidia-smi",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  }
+}
