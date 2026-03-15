@@ -10,7 +10,7 @@ type GpuInfo = {
 };
 
 type QueryResult =
-	| { ok: true; source: "nvidia-smi"; gpus: GpuInfo[] }
+	| { ok: true; source: string; gpus: GpuInfo[] }
 	| { ok: false; summary?: string; error: string };
 
 const WIDGET_KEY = "gpu-monitor";
@@ -26,6 +26,11 @@ function clamp(value: number, min: number, max: number): number {
 
 function toInt(value: string): number {
 	const parsed = Number.parseInt(value.trim(), 10);
+	return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function toFloat(value: string): number {
+	const parsed = Number.parseFloat(value.trim());
 	return Number.isFinite(parsed) ? parsed : 0;
 }
 
@@ -59,6 +64,23 @@ function summarizeGpuTypes(gpus: GpuInfo[]): string {
 	const extra = groups.length > 2 ? ` +${groups.length - 2} types` : "";
 	return head + extra;
 }
+
+// ---------------------------------------------------------------------------
+// Platform detection
+// ---------------------------------------------------------------------------
+
+type Platform = "darwin" | "linux" | "unknown";
+
+function detectPlatform(): Platform {
+	const p = process.platform;
+	if (p === "darwin") return "darwin";
+	if (p === "linux") return "linux";
+	return "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// NVIDIA (Linux / CUDA machines)
+// ---------------------------------------------------------------------------
 
 async function queryNvidiaSmi(pi: ExtensionAPI, cwd: string): Promise<QueryResult> {
 	const result = await pi.exec(
@@ -102,7 +124,120 @@ async function queryNvidiaSmi(pi: ExtensionAPI, cwd: string): Promise<QueryResul
 	return { ok: true, source: "nvidia-smi", gpus };
 }
 
-async function queryFallbackSummary(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
+// ---------------------------------------------------------------------------
+// Apple Silicon (macOS) — uses ioreg for GPU utilization (no sudo needed)
+// ---------------------------------------------------------------------------
+
+/** Cache the chip name so we don't shell out every poll. */
+let cachedAppleChipName: string | undefined;
+
+async function getAppleChipName(pi: ExtensionAPI, cwd: string): Promise<string> {
+	if (cachedAppleChipName) return cachedAppleChipName;
+
+	// sysctl gives us the exact chip, e.g. "Apple M2 Max"
+	const sysctl = await pi.exec("sysctl", ["-n", "machdep.cpu.brand_string"], { cwd, timeout: 2000 });
+	if (sysctl.code === 0 && sysctl.stdout.trim()) {
+		cachedAppleChipName = sysctl.stdout.trim();
+		return cachedAppleChipName;
+	}
+
+	cachedAppleChipName = "Apple Silicon";
+	return cachedAppleChipName;
+}
+
+/**
+ * Query Apple GPU utilization via ioreg.
+ *
+ * On Apple Silicon, the IOAccelerator service publishes PerformanceStatistics
+ * that include "Device Utilization %" (or similar keys). This works without
+ * sudo and is the same data source Activity Monitor uses.
+ *
+ * Memory: Apple Silicon uses unified memory — there is no dedicated VRAM.
+ * We report system memory pressure instead (via vm_stat or sysctl), which is
+ * what actually matters for GPU workloads on these machines.
+ */
+async function queryAppleGpu(pi: ExtensionAPI, cwd: string): Promise<QueryResult> {
+	// ioreg dumps the IOAccelerator performance statistics
+	const ioreg = await pi.exec(
+		"ioreg",
+		["-r", "-d", "1", "-c", "IOAccelerator", "-l"],
+		{ cwd, timeout: 3000 },
+	);
+
+	if (ioreg.code !== 0 || ioreg.killed) {
+		return { ok: false, error: "ioreg failed" };
+	}
+
+	const output = ioreg.stdout;
+
+	// Parse GPU utilization from PerformanceStatistics
+	// Look for "Device Utilization %" = <number> or similar keys
+	const utilMatch =
+		output.match(/"Device Utilization %"\s*=\s*(\d+)/) ??
+		output.match(/"GPU Activity\(%\)"\s*=\s*(\d+)/) ??
+		output.match(/"GPU Busy\s*%?"\s*=\s*(\d+)/);
+
+	const util = utilMatch ? clamp(toInt(utilMatch[1] ?? "0"), 0, 100) : 0;
+
+	// Try to get In-use system memory from PerformanceStatistics
+	// "In use system memory" is in bytes on Apple Silicon
+	const inUseMatch = output.match(/"In use system memory"\s*=\s*(\d+)/);
+	const allocMatch = output.match(/"Alloc system memory"\s*=\s*(\d+)/);
+
+	let memUsedMiB = 0;
+	if (inUseMatch) {
+		memUsedMiB = Math.round(toFloat(inUseMatch[1] ?? "0") / (1024 * 1024));
+	} else if (allocMatch) {
+		memUsedMiB = Math.round(toFloat(allocMatch[1] ?? "0") / (1024 * 1024));
+	}
+
+	// Get total system memory via sysctl (unified memory)
+	let memTotalMiB = 0;
+	const memResult = await pi.exec("sysctl", ["-n", "hw.memsize"], { cwd, timeout: 2000 });
+	if (memResult.code === 0) {
+		memTotalMiB = Math.round(toFloat(memResult.stdout.trim()) / (1024 * 1024));
+	}
+
+	const chipName = await getAppleChipName(pi, cwd);
+
+	const gpus: GpuInfo[] = [
+		{
+			index: 0,
+			name: chipName,
+			util,
+			memoryUsedMiB: memUsedMiB,
+			memoryTotalMiB: memTotalMiB,
+		},
+	];
+
+	return { ok: true, source: "ioreg", gpus };
+}
+
+// ---------------------------------------------------------------------------
+// macOS fallback: system_profiler for GPU identification
+// ---------------------------------------------------------------------------
+
+async function queryMacFallbackSummary(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
+	const result = await pi.exec(
+		"system_profiler",
+		["SPDisplaysDataType", "-detailLevel", "mini"],
+		{ cwd, timeout: 5000 },
+	);
+	if (result.code !== 0 || result.killed) return undefined;
+
+	// Extract chipset/chip lines
+	const chipMatch =
+		result.stdout.match(/Chipset Model:\s*(.+)/i) ??
+		result.stdout.match(/Chip:\s*(.+)/i);
+
+	return chipMatch ? chipMatch[1]!.trim() : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Linux fallback: lspci
+// ---------------------------------------------------------------------------
+
+async function queryLinuxFallbackSummary(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
 	const result = await pi.exec("lspci", [], { cwd, timeout: 2000 });
 	if (result.code !== 0 || result.killed) return undefined;
 
@@ -126,6 +261,42 @@ async function queryFallbackSummary(pi: ExtensionAPI, cwd: string): Promise<stri
 		.map(([name, count]) => `${count}× ${name}`)
 		.join(", ");
 }
+
+// ---------------------------------------------------------------------------
+// Unified query dispatcher
+// ---------------------------------------------------------------------------
+
+async function queryGpu(pi: ExtensionAPI, cwd: string, platform: Platform): Promise<QueryResult> {
+	if (platform === "darwin") {
+		// On macOS, try Apple GPU first (covers Apple Silicon).
+		// If that fails, try nvidia-smi (external NVIDIA eGPUs).
+		const appleResult = await queryAppleGpu(pi, cwd);
+		if (appleResult.ok) return appleResult;
+
+		const nvidiaResult = await queryNvidiaSmi(pi, cwd);
+		if (nvidiaResult.ok) return nvidiaResult;
+
+		return {
+			ok: false,
+			error: appleResult.error,
+			summary: await queryMacFallbackSummary(pi, cwd),
+		};
+	}
+
+	// Linux / other: nvidia-smi is the primary path
+	const nvidiaResult = await queryNvidiaSmi(pi, cwd);
+	if (nvidiaResult.ok) return nvidiaResult;
+
+	return {
+		ok: false,
+		error: nvidiaResult.error,
+		summary: await queryLinuxFallbackSummary(pi, cwd),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Rendering helpers (unchanged)
+// ---------------------------------------------------------------------------
 
 function sparkline(history: number[]): string {
 	return history
@@ -151,7 +322,13 @@ function memoryColor(percent: number): "muted" | "success" | "warning" | "error"
 	return "muted";
 }
 
+// ---------------------------------------------------------------------------
+// Extension entry point
+// ---------------------------------------------------------------------------
+
 export default function gpuMonitorExtension(pi: ExtensionAPI) {
+	const platform = detectPlatform();
+
 	let enabled = false;
 	let refreshMs = DEFAULT_REFRESH_MS;
 	let currentCtx: ExtensionContext | undefined;
@@ -201,15 +378,27 @@ export default function gpuMonitorExtension(pi: ExtensionAPI) {
 			const history = histories.get(gpu.index) ?? [gpu.util];
 			const memPercent = gpu.memoryTotalMiB > 0 ? Math.round((gpu.memoryUsedMiB / gpu.memoryTotalMiB) * 100) : 0;
 			const spark = sparkline(history).padStart(HISTORY_POINTS, SPARK_BLOCKS[0]!);
+
+			// On Apple Silicon with unified memory, show GPU memory allocation
+			// rather than total system RAM (which would be misleading)
+			const memLabel = gpu.memoryTotalMiB > 0
+				? `${formatGiB(gpu.memoryUsedMiB)}/${formatGiB(gpu.memoryTotalMiB)}`
+				: gpu.memoryUsedMiB > 0
+					? `${formatGiB(gpu.memoryUsedMiB)} alloc`
+					: "";
+
+			const memSegment = memLabel
+				? " " + theme.fg(memoryColor(memPercent), memLabel)
+				: "";
+
 			segments.push(
-				theme.fg("dim", `${gpu.index}`) +
+				(gpus.length > 1 ? theme.fg("dim", `${gpu.index}`) : "") +
 					theme.fg("dim", "[") +
 					theme.fg(utilColor(gpu.util), spark) +
 					theme.fg("dim", "]") +
 					" " +
 					theme.fg(utilColor(gpu.util), `${gpu.util}%`) +
-					" " +
-					theme.fg(memoryColor(memPercent), `${formatGiB(gpu.memoryUsedMiB)}/${formatGiB(gpu.memoryTotalMiB)}`),
+					memSegment,
 			);
 		}
 
@@ -297,16 +486,8 @@ export default function gpuMonitorExtension(pi: ExtensionAPI) {
 		if (!enabled || !currentCtx || pollInFlight) return;
 		pollInFlight = true;
 		try {
-			const snapshot = await queryNvidiaSmi(pi, currentCtx.cwd);
-			if (snapshot.ok) {
-				applySnapshot(snapshot);
-			} else {
-				applySnapshot({
-					ok: false,
-					error: snapshot.error,
-					summary: await queryFallbackSummary(pi, currentCtx.cwd),
-				});
-			}
+			const snapshot = await queryGpu(pi, currentCtx.cwd, platform);
+			applySnapshot(snapshot);
 		} catch (error) {
 			applySnapshot({
 				ok: false,
